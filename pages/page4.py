@@ -12,8 +12,7 @@ load_dotenv()
 
 os.environ["CHROMA_OPENAI_API_KEY"] = os.environ["OPENAI_API_KEY"]
 
-CHUNKS_FOLDER = "chunks/Mohazab v Dick Smith Electronics Pty Ltd [No 2] (1995) 62 IR 200"
-CASE_NAME = "Mohazab v Dick Smith Electronics Pty Ltd [No 2] (1995) 62 IR 200"
+CHUNKS_ROOT = "chunks"  # parent folder containing one subfolder per case
 
 @st.cache_resource
 def get_collection():
@@ -28,75 +27,96 @@ def get_collection():
         embedding_function=openai_ef,
     )
 
-    folder = Path(CHUNKS_FOLDER)
-    if folder.exists():
-        files = sorted(folder.glob("chunk_*.json"))
+    root = Path(CHUNKS_ROOT)
+    if root.exists():
         documents, metadatas, ids = [], [], []
 
-        for file in files:
-            with open(file, "r", encoding="utf-8", errors="ignore") as f:
-                data = json.load(f)
+        for case_folder in sorted(p for p in root.iterdir() if p.is_dir()):
+            case_name = case_folder.name
 
-            # try common key names for the chunk's actual text
-            text = None
-            for key in ("text", "content", "chunk_text", "page_content", "body"):
-                if key in data and data[key]:
-                    text = data[key].strip()
-                    break
+            for file in sorted(case_folder.glob("chunk_*.json")):
+                with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                    data = json.load(f)
 
-            if not text:
-                st.warning(f"Couldn't find text field in {file.name} — check its keys: {list(data.keys())}")
-                continue
+                text = None
+                for key in ("text", "content", "chunk_text", "page_content", "body"):
+                    if key in data and data[key]:
+                        text = data[key].strip()
+                        break
 
-            meta = {"source": CASE_NAME, "filename": file.name}
-            # carry through any extra metadata fields that aren't the main text
-            for key, value in data.items():
-                if key not in ("text", "content", "chunk_text", "page_content", "body") and isinstance(value, (str, int, float)):
-                    meta[key] = value
+                if not text:
+                    st.warning(f"Couldn't find text field in {case_folder.name}/{file.name} — keys: {list(data.keys())}")
+                    continue
 
-            documents.append(text)
-            metadatas.append(meta)
-            ids.append(hashlib.md5(file.name.encode()).hexdigest())
+                meta = {"source": case_name, "filename": file.name}
+                for key, value in data.items():
+                    if key not in ("text", "content", "chunk_text", "page_content", "body") and isinstance(value, (str, int, float)):
+                        meta[key] = value
+
+                documents.append(text)
+                metadatas.append(meta)
+                ids.append(hashlib.md5(f"{case_name}/{file.name}".encode()).hexdigest())
 
         if documents:
             collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
 
     return collection
 
+
+def get_case_names():
+    """List case folder names, used to populate the dropdown."""
+    root = Path(CHUNKS_ROOT)
+    if not root.exists():
+        return []
+    return sorted(p.name for p in root.iterdir() if p.is_dir())
+
+
 collection = get_collection()
 
 # --- Search UI ---
-st.title(f"{CASE_NAME.split('[')[0].strip()} — Search")
+st.title("Case Law Search")
+
+case_names = get_case_names()
+selected_case = st.selectbox("Select a case to search", case_names)
+
 query = st.text_input("Search query")
-n_results = 1
+n_results = 3
 
 client = OpenAI()
 
-if st.button("Search") and query:
-    results = collection.query(query_texts=[query], n_results=n_results)
-    for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
-        with st.container(border=True):
-            st.write(doc)
-            st.caption(f"source: {meta.get('filename')} · distance: {dist:.3f}")
+if st.button("Search") and query and selected_case:
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results,
+        where={"source": selected_case},  # restrict search to the chosen case only
+    )
 
-    context = "\n\n---\n\n".join(results["documents"][0])
+    if not results["documents"][0]:
+        st.info("No matching chunks found in this case.")
+    else:
+        for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+            with st.container(border=True):
+                st.write(doc)
+                st.caption(f"file: {meta.get('filename')} · distance: {dist:.3f}")
 
-    prompt = f"""You are a legal research assistant. Answer the question using only the context below.
-    If the context doesn't contain the answer, say so — do not make anything up.
+        context = "\n\n---\n\n".join(results["documents"][0])
 
-    Context:
-    {context}
+        prompt = f"""You are a legal research assistant. Answer the question using only the context below.
+        If the context doesn't contain the answer, say so — do not make anything up.
 
-    Question: {query}
+        Context:
+        {context}
 
-    Answer:"""
+        Question: {query}
 
-    with st.spinner("Generating response..."):
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
+        Answer:"""
 
-    st.subheader("Answer")
-    st.write(response.choices[0].message.content)
+        with st.spinner("Generating response..."):
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+            )
+
+        st.subheader("Answer")
+        st.write(response.choices[0].message.content)
