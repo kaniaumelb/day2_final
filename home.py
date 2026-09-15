@@ -9,3 +9,4 @@ st.title("Home")
 st.write("Welcome to my app")
 
 st.page_link("pages/page1.py", label="Go to Page 1")
+st.page_link("pages/page2.py", label="Go to Page 2")
