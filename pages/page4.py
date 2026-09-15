@@ -1,23 +1,102 @@
 import streamlit as st
-from openai import OpenAI
+import chromadb
+from chromadb.utils import embedding_functions
+from pathlib import Path
+import hashlib
+import json
+import os
 from dotenv import load_dotenv
-import numpy as np
+from openai import OpenAI
 
 load_dotenv()
 
-st.title("Exercise 2.4")
+os.environ["CHROMA_OPENAI_API_KEY"] = os.environ["OPENAI_API_KEY"]
 
+CHUNKS_FOLDER = "chunks/Mohazab v Dick Smith Electronics Pty Ltd [No 2] (1995) 62 IR 200"
+CASE_NAME = "Mohazab v Dick Smith Electronics Pty Ltd [No 2] (1995) 62 IR 200"
 
-# setup a vector database
+@st.cache_resource
+def get_collection():
+    client = chromadb.PersistentClient(path="./my_chroma_db")
 
-# 1. allows the user to ask questions of the document from page
+    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+        model_name="text-embedding-3-large",
+    )
 
-# text area for a user question
+    collection = client.get_or_create_collection(
+        name="knowledge_base",
+        embedding_function=openai_ef,
+    )
 
-# 2. retrieves the most relevant part of the document and uses this to answer the question
+    folder = Path(CHUNKS_FOLDER)
+    if folder.exists():
+        files = sorted(folder.glob("chunk_*.json"))
+        documents, metadatas, ids = [], [], []
 
-# retrieve most relevant chunks from vector database
+        for file in files:
+            with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
 
-# 3. responds to the user citing what information was used from the document
+            # try common key names for the chunk's actual text
+            text = None
+            for key in ("text", "content", "chunk_text", "page_content", "body"):
+                if key in data and data[key]:
+                    text = data[key].strip()
+                    break
 
-# as a genAI using the enginereed context (user query + best chunk) to answer question
+            if not text:
+                st.warning(f"Couldn't find text field in {file.name} — check its keys: {list(data.keys())}")
+                continue
+
+            meta = {"source": CASE_NAME, "filename": file.name}
+            # carry through any extra metadata fields that aren't the main text
+            for key, value in data.items():
+                if key not in ("text", "content", "chunk_text", "page_content", "body") and isinstance(value, (str, int, float)):
+                    meta[key] = value
+
+            documents.append(text)
+            metadatas.append(meta)
+            ids.append(hashlib.md5(file.name.encode()).hexdigest())
+
+        if documents:
+            collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+
+    return collection
+
+collection = get_collection()
+
+# --- Search UI ---
+st.title(f"{CASE_NAME.split('[')[0].strip()} — Search")
+query = st.text_input("Search query")
+n_results = 1
+
+client = OpenAI()
+
+if st.button("Search") and query:
+    results = collection.query(query_texts=[query], n_results=n_results)
+    for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+        with st.container(border=True):
+            st.write(doc)
+            st.caption(f"source: {meta.get('filename')} · distance: {dist:.3f}")
+
+    context = "\n\n---\n\n".join(results["documents"][0])
+
+    prompt = f"""You are a legal research assistant. Answer the question using only the context below.
+    If the context doesn't contain the answer, say so — do not make anything up.
+
+    Context:
+    {context}
+
+    Question: {query}
+
+    Answer:"""
+
+    with st.spinner("Generating response..."):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+
+    st.subheader("Answer")
+    st.write(response.choices[0].message.content)
